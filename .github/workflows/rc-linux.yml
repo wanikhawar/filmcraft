@@ -1,0 +1,103 @@
+# Fork-only: Linux x86_64 release-candidate build. Never goes upstream (it lives on the fork's main
+# because workflow_dispatch only finds workflows on the default branch). Mirrors the linux job of
+# storytold/craft-common-actions release.yml, without signing, aarch64 or the release environment.
+name: RC Linux build
+run-name: RC Linux build of ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch to build, e.g. rc/perf-1"
+        type: string
+        required: true
+      version:
+        description: "Version, e.g. 0.17.1-rc.1"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  git-sources:
+    name: Git dependencies come from storytold
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - run: |
+          set -euo pipefail
+          test -f Cargo.lock
+          cargo metadata --locked --format-version 1 > /dev/null
+          python3 - <<'PY'
+          import sys, tomllib
+          lock = tomllib.load(open("Cargo.lock", "rb"))
+          bad = sorted({p["source"] for p in lock.get("package", [])
+                        if p.get("source", "").startswith("git+")
+                        and not p["source"].startswith("git+https://github.com/storytold/")})
+          if bad:
+              print("Git dependencies outside github.com/storytold:", *bad, sep="\n")
+              sys.exit(1)
+          PY
+
+  linux:
+    name: Linux x86_64
+    needs: git-sources
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Read the branch's craft-fonts pin
+        id: fonts
+        run: echo "ref=$(sed -n 's/^ *craft-fonts-ref: *\([0-9a-f]\{40\}\).*/\1/p' .github/workflows/release.yml | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Resolve build date
+        id: v
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - name: Export the app's build variables
+        uses: storytold/craft-common-actions/actions/export-app-build-env@main
+        with:
+          app-name: filmcraft
+          version: ${{ inputs.version }}
+          date: ${{ steps.v.outputs.date }}
+      - name: Check out craft-fonts
+        if: steps.fonts.outputs.ref != ''
+        uses: storytold/craft-common-actions/actions/checkout-craft-fonts@main
+        with:
+          ref: ${{ steps.fonts.outputs.ref }}
+      - uses: storytold/craft-common-actions/actions/checkout-craft-i18n@main
+      - uses: storytold/craft-common-actions/actions/install-linux-deps@main
+        with:
+          deb-arch: amd64
+          nfpm-version: "2.47.0"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: rc-linux-x86_64
+      - run: cargo xtask version set "$VERSION"
+      - name: Build and package
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: packaging/linux/package.sh
+      - name: Check the AppImage
+        run: |
+          for a in dist/release/*.AppImage; do chmod +x "$a"; APPIMAGE_EXTRACT_AND_RUN=1 "$a" --version || true; done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rc-linux-x86_64
+          path: dist/release/*
+          if-no-files-found: error
