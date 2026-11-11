@@ -56,26 +56,30 @@ pub fn to_yuv444_10(rgba: &[u8], hdr: Option<&[f32]>, w: usize, h: usize, m: Mat
 pub fn rgba_to_yuv422_10(rgba: &[u8], w: usize, h: usize, y: &mut [u16], cb: &mut [u16], cr: &mut [u16]) {
     let cw = w.div_ceil(2);
     debug_assert!(y.len() >= w * h && rgba.len() >= w * h * 4);
-    y.par_chunks_mut(w).zip(cb.par_chunks_mut(cw).zip(cr.par_chunks_mut(cw))).enumerate().for_each(|(row, (yr, (cbr, crr)))| {
-        let src = &rgba[row * w * 4..(row + 1) * w * 4];
-        let mut us = vec![0f32; w];
-        let mut vs = vec![0f32; w];
-        for x in 0..w {
-            let (r, g, b) = (src[x * 4] as f32 / 255.0, src[x * 4 + 1] as f32 / 255.0, src[x * 4 + 2] as f32 / 255.0);
-            let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            yr[x] = (64.0 + 876.0 * yy).round().clamp(4.0, 1019.0) as u16;
-            us[x] = (b - yy) / 1.8556;
-            vs[x] = (r - yy) / 1.5748;
-        }
-        for cx in 0..cw {
-            let a = cx * 2;
-            let b2 = (a + 1).min(w - 1);
-            let u = (us[a] + us[b2]) * 0.5;
-            let v = (vs[a] + vs[b2]) * 0.5;
-            cbr[cx] = (512.0 + 896.0 * u).round().clamp(4.0, 1019.0) as u16;
-            crr[cx] = (512.0 + 896.0 * v).round().clamp(4.0, 1019.0) as u16;
-        }
-    });
+    // one pair of scratch rows per worker thread, not per row
+    y.par_chunks_mut(w).zip(cb.par_chunks_mut(cw).zip(cr.par_chunks_mut(cw))).enumerate().for_each_init(
+        || (vec![0f32; w], vec![0f32; w]),
+        |(us, vs), (row, (yr, (cbr, crr)))| {
+            // a short source leaves the row as it was instead of indexing past the end
+            let Some(src) = rgba.get(row * w * 4..(row + 1) * w * 4) else { return };
+            for (p, (yo, (u, v))) in src.as_chunks::<4>().0.iter().zip(yr.iter_mut().zip(us.iter_mut().zip(vs.iter_mut()))) {
+                let (r, g, b) = (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0);
+                let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                *yo = (64.0 + 876.0 * yy).round().clamp(4.0, 1019.0) as u16;
+                *u = (b - yy) / 1.8556;
+                *v = (r - yy) / 1.5748;
+            }
+            for (cx, (cbo, cro)) in cbr.iter_mut().zip(crr.iter_mut()).enumerate() {
+                let a = cx * 2;
+                let b2 = (a + 1).min(w.saturating_sub(1));
+                let (Some(&ua), Some(&ub), Some(&va), Some(&vb)) = (us.get(a), us.get(b2), vs.get(a), vs.get(b2)) else { continue };
+                let u = (ua + ub) * 0.5;
+                let v = (va + vb) * 0.5;
+                *cbo = (512.0 + 896.0 * u).round().clamp(4.0, 1019.0) as u16;
+                *cro = (512.0 + 896.0 * v).round().clamp(4.0, 1019.0) as u16;
+            }
+        },
+    );
 }
 
 /// Limited-range 10-bit 4:2:2 from encoded R'G'B' floats with matrix (Kr, Kb).
@@ -85,24 +89,28 @@ pub fn rgbf_to_yuv422_10(rgb: &[f32], w: usize, h: usize, m: Matrix, y: &mut [u1
     debug_assert!(rgb.len() >= w * h * 3 && y.len() >= w * h);
     let kg = 1.0 - kr - kb;
     let (sb, sr) = (2.0 * (1.0 - kb), 2.0 * (1.0 - kr));
-    y.par_chunks_mut(w).zip(cb.par_chunks_mut(cw).zip(cr.par_chunks_mut(cw))).enumerate().for_each(|(row, (yr, (cbr, crr)))| {
-        let src = &rgb[row * w * 3..(row + 1) * w * 3];
-        let mut us = vec![0f32; w];
-        let mut vs = vec![0f32; w];
-        for x in 0..w {
-            let (r, g, b) = (src[x * 3], src[x * 3 + 1], src[x * 3 + 2]);
-            let yy = kr * r + kg * g + kb * b;
-            yr[x] = (64.0 + 876.0 * yy).round().clamp(4.0, 1019.0) as u16;
-            us[x] = (b - yy) / sb;
-            vs[x] = (r - yy) / sr;
-        }
-        for cx in 0..cw {
-            let a = cx * 2;
-            let b2 = (a + 1).min(w - 1);
-            cbr[cx] = (512.0 + 896.0 * (us[a] + us[b2]) * 0.5).round().clamp(4.0, 1019.0) as u16;
-            crr[cx] = (512.0 + 896.0 * (vs[a] + vs[b2]) * 0.5).round().clamp(4.0, 1019.0) as u16;
-        }
-    });
+    // one pair of scratch rows per worker thread, not per row
+    y.par_chunks_mut(w).zip(cb.par_chunks_mut(cw).zip(cr.par_chunks_mut(cw))).enumerate().for_each_init(
+        || (vec![0f32; w], vec![0f32; w]),
+        |(us, vs), (row, (yr, (cbr, crr)))| {
+            // a short source leaves the row as it was instead of indexing past the end
+            let Some(src) = rgb.get(row * w * 3..(row + 1) * w * 3) else { return };
+            for (p, (yo, (u, v))) in src.as_chunks::<3>().0.iter().zip(yr.iter_mut().zip(us.iter_mut().zip(vs.iter_mut()))) {
+                let (r, g, b) = (p[0], p[1], p[2]);
+                let yy = kr * r + kg * g + kb * b;
+                *yo = (64.0 + 876.0 * yy).round().clamp(4.0, 1019.0) as u16;
+                *u = (b - yy) / sb;
+                *v = (r - yy) / sr;
+            }
+            for (cx, (cbo, cro)) in cbr.iter_mut().zip(crr.iter_mut()).enumerate() {
+                let a = cx * 2;
+                let b2 = (a + 1).min(w.saturating_sub(1));
+                let (Some(&ua), Some(&ub), Some(&va), Some(&vb)) = (us.get(a), us.get(b2), vs.get(a), vs.get(b2)) else { continue };
+                *cbo = (512.0 + 896.0 * (ua + ub) * 0.5).round().clamp(4.0, 1019.0) as u16;
+                *cro = (512.0 + 896.0 * (va + vb) * 0.5).round().clamp(4.0, 1019.0) as u16;
+            }
+        },
+    );
 }
 
 /// `x.round().clamp(1.0, 254.0) as u8` for the finite values the conversions produce, without
@@ -211,30 +219,33 @@ pub fn rgba_to_yuv420_10(rgba: &[u8], w: usize, h: usize, y: &mut Vec<u16>, u: &
     v.clear();
     v.resize(cw * ch, 0);
     let code = |x: f32| x.round().clamp(4.0, 1019.0) as u16;
-    y.par_chunks_mut(w * 2).zip(u.par_chunks_mut(cw).zip(v.par_chunks_mut(cw))).enumerate().for_each(|(cy, (yr, (ur, vr)))| {
-        let mut us = vec![0f32; cw];
-        let mut vs = vec![0f32; cw];
-        let mut cnt = vec![0f32; cw];
-        for (dy, yrow) in yr.chunks_exact_mut(w).enumerate() {
-            let row = cy * 2 + dy;
-            let Some(src) = rgba.get(row * w * 4..(row + 1) * w * 4) else { continue };
-            for (x, (&[r, g, b, _], yo)) in src.as_chunks::<4>().0.iter().zip(yrow.iter_mut()).enumerate() {
-                let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
-                let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                *yo = code(64.0 + 876.0 * yy);
-                if let (Some(a), Some(c), Some(n)) = (us.get_mut(x / 2), vs.get_mut(x / 2), cnt.get_mut(x / 2)) {
-                    *a += (b - yy) / 1.8556;
-                    *c += (r - yy) / 1.5748;
-                    *n += 1.0;
+    y.par_chunks_mut(w * 2).zip(u.par_chunks_mut(cw).zip(v.par_chunks_mut(cw))).enumerate().for_each_init(
+        || (vec![0f32; cw], vec![0f32; cw], vec![0f32; cw]),
+        |(us, vs, cnt), (cy, (yr, (ur, vr)))| {
+            us.fill(0.0);
+            vs.fill(0.0);
+            cnt.fill(0.0);
+            for (dy, yrow) in yr.chunks_exact_mut(w).enumerate() {
+                let row = cy * 2 + dy;
+                let Some(src) = rgba.get(row * w * 4..(row + 1) * w * 4) else { continue };
+                for (x, (&[r, g, b, _], yo)) in src.as_chunks::<4>().0.iter().zip(yrow.iter_mut()).enumerate() {
+                    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+                    let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    *yo = code(64.0 + 876.0 * yy);
+                    if let (Some(a), Some(c), Some(n)) = (us.get_mut(x / 2), vs.get_mut(x / 2), cnt.get_mut(x / 2)) {
+                        *a += (b - yy) / 1.8556;
+                        *c += (r - yy) / 1.5748;
+                        *n += 1.0;
+                    }
                 }
             }
-        }
-        for (cx, (uo, vo)) in ur.iter_mut().zip(vr.iter_mut()).enumerate() {
-            let n = cnt.get(cx).copied().unwrap_or(1.0).max(1.0);
-            *uo = code(512.0 + 896.0 * us.get(cx).copied().unwrap_or(0.0) / n);
-            *vo = code(512.0 + 896.0 * vs.get(cx).copied().unwrap_or(0.0) / n);
-        }
-    });
+            for (cx, (uo, vo)) in ur.iter_mut().zip(vr.iter_mut()).enumerate() {
+                let n = cnt.get(cx).copied().unwrap_or(1.0).max(1.0);
+                *uo = code(512.0 + 896.0 * us.get(cx).copied().unwrap_or(0.0) / n);
+                *vo = code(512.0 + 896.0 * vs.get(cx).copied().unwrap_or(0.0) / n);
+            }
+        },
+    );
     Ok(())
 }
 
@@ -253,28 +264,31 @@ pub fn rgbf_to_yuv420_8(rgb: &[f32], w: usize, h: usize, m: Matrix, y: &mut Vec<
     y.resize(w * h, 0);
     u.resize(cw * ch, 0);
     v.resize(cw * ch, 0);
-    y.par_chunks_mut(w * 2).zip(u.par_chunks_mut(cw).zip(v.par_chunks_mut(cw))).enumerate().for_each(|(cy, (yr, (ur, vr)))| {
-        let rows = yr.len() / w;
-        let mut us = vec![0f32; cw];
-        let mut vs = vec![0f32; cw];
-        let mut cnt = vec![0f32; cw];
-        for dy in 0..rows {
-            let row = cy * 2 + dy;
-            let src = &rgb[row * w * 3..(row + 1) * w * 3];
-            for x in 0..w {
-                let (r, g, b) = (src[x * 3], src[x * 3 + 1], src[x * 3 + 2]);
-                let yy = kr * r + kg * g + kb * b;
-                yr[dy * w + x] = (16.0 + 219.0 * yy).round().clamp(1.0, 254.0) as u8;
-                us[x / 2] += (b - yy) / sb;
-                vs[x / 2] += (r - yy) / sr;
-                cnt[x / 2] += 1.0;
+    y.par_chunks_mut(w * 2).zip(u.par_chunks_mut(cw).zip(v.par_chunks_mut(cw))).enumerate().for_each_init(
+        || (vec![0f32; cw], vec![0f32; cw], vec![0f32; cw]),
+        |(us, vs, cnt), (cy, (yr, (ur, vr)))| {
+            let rows = yr.len() / w;
+            us.fill(0.0);
+            vs.fill(0.0);
+            cnt.fill(0.0);
+            for dy in 0..rows {
+                let row = cy * 2 + dy;
+                let src = &rgb[row * w * 3..(row + 1) * w * 3];
+                for x in 0..w {
+                    let (r, g, b) = (src[x * 3], src[x * 3 + 1], src[x * 3 + 2]);
+                    let yy = kr * r + kg * g + kb * b;
+                    yr[dy * w + x] = (16.0 + 219.0 * yy).round().clamp(1.0, 254.0) as u8;
+                    us[x / 2] += (b - yy) / sb;
+                    vs[x / 2] += (r - yy) / sr;
+                    cnt[x / 2] += 1.0;
+                }
             }
-        }
-        for cx in 0..cw {
-            ur[cx] = (128.0 + 224.0 * us[cx] / cnt[cx]).round().clamp(1.0, 254.0) as u8;
-            vr[cx] = (128.0 + 224.0 * vs[cx] / cnt[cx]).round().clamp(1.0, 254.0) as u8;
-        }
-    });
+            for cx in 0..cw {
+                ur[cx] = (128.0 + 224.0 * us[cx] / cnt[cx]).round().clamp(1.0, 254.0) as u8;
+                vr[cx] = (128.0 + 224.0 * vs[cx] / cnt[cx]).round().clamp(1.0, 254.0) as u8;
+            }
+        },
+    );
 }
 
 /// Limited-range 10-bit 4:2:0 (code values 0..1023, not MSB-aligned) from encoded R'G'B' floats with
@@ -302,31 +316,34 @@ pub fn rgbf_to_yuv420_10(rgb: &[f32], w: usize, h: usize, m: Matrix, y: &mut Vec
     v.resize(cw * ch, 0);
     let unit = |x: f32| if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
     let code = |x: f32| x.round().clamp(4.0, 1019.0) as u16;
-    y.par_chunks_mut(w * 2).zip(u.par_chunks_mut(cw).zip(v.par_chunks_mut(cw))).enumerate().for_each(|(cy, (yr, (ur, vr)))| {
-        let rows = yr.len() / w;
-        let mut us = vec![0f32; cw];
-        let mut vs = vec![0f32; cw];
-        let mut cnt = vec![0f32; cw];
-        for (dy, yrow) in yr.chunks_exact_mut(w).enumerate().take(rows) {
-            let row = cy * 2 + dy;
-            let Some(src) = rgb.get(row * w * 3..(row + 1) * w * 3) else { continue };
-            for (x, (&[r, g, b], yo)) in src.as_chunks::<3>().0.iter().zip(yrow.iter_mut()).enumerate() {
-                let (r, g, b) = (unit(r), unit(g), unit(b));
-                let yy = kr * r + kg * g + kb * b;
-                *yo = code(64.0 + 876.0 * yy);
-                if let (Some(a), Some(c), Some(n)) = (us.get_mut(x / 2), vs.get_mut(x / 2), cnt.get_mut(x / 2)) {
-                    *a += (b - yy) / sb;
-                    *c += (r - yy) / sr;
-                    *n += 1.0;
+    y.par_chunks_mut(w * 2).zip(u.par_chunks_mut(cw).zip(v.par_chunks_mut(cw))).enumerate().for_each_init(
+        || (vec![0f32; cw], vec![0f32; cw], vec![0f32; cw]),
+        |(us, vs, cnt), (cy, (yr, (ur, vr)))| {
+            let rows = yr.len() / w;
+            us.fill(0.0);
+            vs.fill(0.0);
+            cnt.fill(0.0);
+            for (dy, yrow) in yr.chunks_exact_mut(w).enumerate().take(rows) {
+                let row = cy * 2 + dy;
+                let Some(src) = rgb.get(row * w * 3..(row + 1) * w * 3) else { continue };
+                for (x, (&[r, g, b], yo)) in src.as_chunks::<3>().0.iter().zip(yrow.iter_mut()).enumerate() {
+                    let (r, g, b) = (unit(r), unit(g), unit(b));
+                    let yy = kr * r + kg * g + kb * b;
+                    *yo = code(64.0 + 876.0 * yy);
+                    if let (Some(a), Some(c), Some(n)) = (us.get_mut(x / 2), vs.get_mut(x / 2), cnt.get_mut(x / 2)) {
+                        *a += (b - yy) / sb;
+                        *c += (r - yy) / sr;
+                        *n += 1.0;
+                    }
                 }
             }
-        }
-        for (cx, (uo, vo)) in ur.iter_mut().zip(vr.iter_mut()).enumerate() {
-            let n = cnt.get(cx).copied().unwrap_or(1.0).max(1.0);
-            *uo = code(512.0 + 896.0 * us.get(cx).copied().unwrap_or(0.0) / n);
-            *vo = code(512.0 + 896.0 * vs.get(cx).copied().unwrap_or(0.0) / n);
-        }
-    });
+            for (cx, (uo, vo)) in ur.iter_mut().zip(vr.iter_mut()).enumerate() {
+                let n = cnt.get(cx).copied().unwrap_or(1.0).max(1.0);
+                *uo = code(512.0 + 896.0 * us.get(cx).copied().unwrap_or(0.0) / n);
+                *vo = code(512.0 + 896.0 * vs.get(cx).copied().unwrap_or(0.0) / n);
+            }
+        },
+    );
     Ok(())
 }
 
@@ -420,6 +437,235 @@ mod tests {
         for c in [[0u8, 0, 0], [255, 255, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255], [255, 0, 255]] {
             let rgba: Vec<u8> = (0..6 * 4).flat_map(|_| [c[0], c[1], c[2], 255]).collect();
             check(&rgba, 6, 4);
+        }
+    }
+
+    // ---- bit-identity of the scratch-free conversions against the pre-change bodies ----
+
+    type P16 = (Vec<u16>, Vec<u16>, Vec<u16>);
+
+    fn reference_rgba_422_10(rgba: &[u8], w: usize, h: usize) -> P16 {
+        let cw = w.div_ceil(2);
+        let (mut y, mut cb, mut cr) = (vec![0u16; w * h], vec![0u16; cw * h], vec![0u16; cw * h]);
+        for row in 0..h {
+            let src = &rgba[row * w * 4..(row + 1) * w * 4];
+            let mut us = vec![0f32; w];
+            let mut vs = vec![0f32; w];
+            for x in 0..w {
+                let (r, g, b) = (src[x * 4] as f32 / 255.0, src[x * 4 + 1] as f32 / 255.0, src[x * 4 + 2] as f32 / 255.0);
+                let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                y[row * w + x] = (64.0 + 876.0 * yy).round().clamp(4.0, 1019.0) as u16;
+                us[x] = (b - yy) / 1.8556;
+                vs[x] = (r - yy) / 1.5748;
+            }
+            for cx in 0..cw {
+                let a = cx * 2;
+                let b2 = (a + 1).min(w - 1);
+                let u = (us[a] + us[b2]) * 0.5;
+                let v = (vs[a] + vs[b2]) * 0.5;
+                cb[row * cw + cx] = (512.0 + 896.0 * u).round().clamp(4.0, 1019.0) as u16;
+                cr[row * cw + cx] = (512.0 + 896.0 * v).round().clamp(4.0, 1019.0) as u16;
+            }
+        }
+        (y, cb, cr)
+    }
+
+    fn reference_rgbf_422_10(rgb: &[f32], w: usize, h: usize, m: Matrix) -> P16 {
+        let Matrix { kr, kb } = m;
+        let cw = w.div_ceil(2);
+        let kg = 1.0 - kr - kb;
+        let (sb, sr) = (2.0 * (1.0 - kb), 2.0 * (1.0 - kr));
+        let (mut y, mut cb, mut cr) = (vec![0u16; w * h], vec![0u16; cw * h], vec![0u16; cw * h]);
+        for row in 0..h {
+            let src = &rgb[row * w * 3..(row + 1) * w * 3];
+            let mut us = vec![0f32; w];
+            let mut vs = vec![0f32; w];
+            for x in 0..w {
+                let (r, g, b) = (src[x * 3], src[x * 3 + 1], src[x * 3 + 2]);
+                let yy = kr * r + kg * g + kb * b;
+                y[row * w + x] = (64.0 + 876.0 * yy).round().clamp(4.0, 1019.0) as u16;
+                us[x] = (b - yy) / sb;
+                vs[x] = (r - yy) / sr;
+            }
+            for cx in 0..cw {
+                let a = cx * 2;
+                let b2 = (a + 1).min(w - 1);
+                cb[row * cw + cx] = (512.0 + 896.0 * (us[a] + us[b2]) * 0.5).round().clamp(4.0, 1019.0) as u16;
+                cr[row * cw + cx] = (512.0 + 896.0 * (vs[a] + vs[b2]) * 0.5).round().clamp(4.0, 1019.0) as u16;
+            }
+        }
+        (y, cb, cr)
+    }
+
+    fn reference_rgba_420_10(rgba: &[u8], w: usize, h: usize) -> P16 {
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let (mut y, mut u, mut v) = (vec![0u16; w * h], vec![0u16; cw * ch], vec![0u16; cw * ch]);
+        let code = |x: f32| x.round().clamp(4.0, 1019.0) as u16;
+        for cy in 0..ch {
+            let mut us = vec![0f32; cw];
+            let mut vs = vec![0f32; cw];
+            let mut cnt = vec![0f32; cw];
+            for row in cy * 2..(cy * 2 + 2).min(h) {
+                for x in 0..w {
+                    let p = &rgba[(row * w + x) * 4..];
+                    let (r, g, b) = (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0);
+                    let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    y[row * w + x] = code(64.0 + 876.0 * yy);
+                    us[x / 2] += (b - yy) / 1.8556;
+                    vs[x / 2] += (r - yy) / 1.5748;
+                    cnt[x / 2] += 1.0;
+                }
+            }
+            for cx in 0..cw {
+                let n = cnt[cx].max(1.0);
+                u[cy * cw + cx] = code(512.0 + 896.0 * us[cx] / n);
+                v[cy * cw + cx] = code(512.0 + 896.0 * vs[cx] / n);
+            }
+        }
+        (y, u, v)
+    }
+
+    /// `rgbf_to_yuv420_8` (`bits8`) or `rgbf_to_yuv420_10` as they were, as `u16` planes.
+    fn reference_rgbf_420(rgb: &[f32], w: usize, h: usize, m: Matrix, bits8: bool) -> P16 {
+        let Matrix { kr, kb } = m;
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let kg = 1.0 - kr - kb;
+        let (sb, sr) = (2.0 * (1.0 - kb), 2.0 * (1.0 - kr));
+        let (mut y, mut u, mut v) = (vec![0u16; w * h], vec![0u16; cw * ch], vec![0u16; cw * ch]);
+        let unit = |x: f32| {
+            if bits8 {
+                x
+            } else if x.is_nan() {
+                0.0
+            } else {
+                x.clamp(0.0, 1.0)
+            }
+        };
+        let luma =
+            |x: f32| if bits8 { (16.0 + 219.0 * x).round().clamp(1.0, 254.0) as u8 as u16 } else { (64.0 + 876.0 * x).round().clamp(4.0, 1019.0) as u16 };
+        let chroma =
+            |x: f32| if bits8 { (128.0 + 224.0 * x).round().clamp(1.0, 254.0) as u8 as u16 } else { (512.0 + 896.0 * x).round().clamp(4.0, 1019.0) as u16 };
+        for cy in 0..ch {
+            let mut us = vec![0f32; cw];
+            let mut vs = vec![0f32; cw];
+            let mut cnt = vec![0f32; cw];
+            for row in cy * 2..(cy * 2 + 2).min(h) {
+                for x in 0..w {
+                    let p = &rgb[(row * w + x) * 3..];
+                    let (r, g, b) = (unit(p[0]), unit(p[1]), unit(p[2]));
+                    let yy = kr * r + kg * g + kb * b;
+                    y[row * w + x] = luma(yy);
+                    us[x / 2] += (b - yy) / sb;
+                    vs[x / 2] += (r - yy) / sr;
+                    cnt[x / 2] += 1.0;
+                }
+            }
+            for cx in 0..cw {
+                let n = cnt[cx].max(1.0);
+                u[cy * cw + cx] = chroma(us[cx] / n);
+                v[cy * cw + cx] = chroma(vs[cx] / n);
+            }
+        }
+        (y, u, v)
+    }
+
+    fn xorshift(seed: &mut u32) -> u32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 17;
+        *seed ^= *seed << 5;
+        *seed
+    }
+
+    const SIZES: [(usize, usize); 6] = [(1, 1), (2, 2), (3, 5), (17, 9), (64, 33), (1921, 3)];
+    const MATRICES: [Matrix; 2] = [Matrix::new(0.2126, 0.0722), Matrix::new(0.2627, 0.0593)];
+
+    fn random_rgba(seed: &mut u32, w: usize, h: usize) -> Vec<u8> {
+        (0..w * h * 4).map(|_| (xorshift(seed) >> 24) as u8).collect()
+    }
+
+    /// Random floats mixed with the values the conversions must survive: NaN, infinities, negatives, above 1.
+    fn random_rgbf(seed: &mut u32, w: usize, h: usize) -> Vec<f32> {
+        const SPECIAL: [f32; 9] = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5, -3.0, 1.0, 1.5, 7.25, 0.0];
+        (0..w * h * 3)
+            .map(|_| {
+                let r = xorshift(seed);
+                match r & 7 {
+                    0 => SPECIAL[(r >> 8) as usize % SPECIAL.len()],
+                    1 => (r >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 0.5,
+                    _ => (r >> 8) as f32 / (1u32 << 24) as f32,
+                }
+            })
+            .collect()
+    }
+
+    fn saturated_rgba(w: usize, h: usize) -> Vec<u8> {
+        const C: [[u8; 3]; 8] = [[0, 0, 0], [255, 255, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255], [255, 0, 255]];
+        (0..w * h).flat_map(|i| [C[i % 8][0], C[i % 8][1], C[i % 8][2], 255]).collect()
+    }
+
+    fn saturated_rgbf(w: usize, h: usize) -> Vec<f32> {
+        const C: [f32; 6] = [0.0, 1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -2.0];
+        (0..w * h * 3).map(|i| C[(i / 3 + i) % C.len()]).collect()
+    }
+
+    #[test]
+    fn yuv422_10_matches_the_pre_change_bodies() {
+        let mut seed = 0x1234_5679u32;
+        for (w, h) in SIZES {
+            let cw = w.div_ceil(2);
+            let mut inputs = vec![random_rgba(&mut seed, w, h), saturated_rgba(w, h)];
+            inputs.push(random_rgba(&mut seed, w, h));
+            for rgba in &inputs {
+                let (mut y, mut cb, mut cr) = (vec![0u16; w * h], vec![0u16; cw * h], vec![0u16; cw * h]);
+                rgba_to_yuv422_10(rgba, w, h, &mut y, &mut cb, &mut cr);
+                assert!((y, cb, cr) == reference_rgba_422_10(rgba, w, h), "rgba {w}x{h}");
+            }
+            let mut floats = vec![random_rgbf(&mut seed, w, h), saturated_rgbf(w, h)];
+            floats.push(random_rgbf(&mut seed, w, h));
+            for rgb in &floats {
+                for m in MATRICES {
+                    let (mut y, mut cb, mut cr) = (vec![0u16; w * h], vec![0u16; cw * h], vec![0u16; cw * h]);
+                    rgbf_to_yuv422_10(rgb, w, h, m, &mut y, &mut cb, &mut cr);
+                    assert!((y, cb, cr) == reference_rgbf_422_10(rgb, w, h, m), "rgbf {w}x{h} kr={}", m.kr);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yuv420_10_and_float_8_match_the_pre_change_bodies() {
+        let mut seed = 0x0bad_cafeu32;
+        for (w, h) in SIZES {
+            for rgba in [random_rgba(&mut seed, w, h), saturated_rgba(w, h)] {
+                let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+                rgba_to_yuv420_10(&rgba, w, h, &mut y, &mut u, &mut v).expect("converts");
+                assert!((y, u, v) == reference_rgba_420_10(&rgba, w, h), "rgba10 {w}x{h}");
+            }
+            for rgb in [random_rgbf(&mut seed, w, h), saturated_rgbf(w, h)] {
+                for m in MATRICES {
+                    let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+                    rgbf_to_yuv420_10(&rgb, w, h, m, &mut y, &mut u, &mut v).expect("converts");
+                    assert!((y, u, v) == reference_rgbf_420(&rgb, w, h, m, false), "rgbf10 {w}x{h} kr={}", m.kr);
+                    let (mut y8, mut u8, mut v8) = (Vec::new(), Vec::new(), Vec::new());
+                    rgbf_to_yuv420_8(&rgb, w, h, m, &mut y8, &mut u8, &mut v8);
+                    let widen = |p: &[u8]| p.iter().map(|&c| u16::from(c)).collect::<Vec<_>>();
+                    assert!((widen(&y8), widen(&u8), widen(&v8)) == reference_rgbf_420(&rgb, w, h, m, true), "rgbf8 {w}x{h} kr={}", m.kr);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reusing_planes_across_calls_gives_the_same_result_as_fresh_ones() {
+        // the for_each_init scratch rows persist across the rows one thread handles: stale values must not leak
+        let mut seed = 0x5eed_5eedu32;
+        let (w, h) = (17, 9);
+        let m = MATRICES[1];
+        let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..3 {
+            let rgb = random_rgbf(&mut seed, w, h);
+            rgbf_to_yuv420_10(&rgb, w, h, m, &mut y, &mut u, &mut v).expect("converts");
+            assert!((y.clone(), u.clone(), v.clone()) == reference_rgbf_420(&rgb, w, h, m, false));
         }
     }
 }

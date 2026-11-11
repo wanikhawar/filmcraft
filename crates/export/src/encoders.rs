@@ -137,6 +137,9 @@ struct ProResEncoder {
     h: u32,
     rate: FrameRate,
     signal: ColorSignal,
+    /// The picture converted into, kept between frames: every conversion overwrites all of its samples,
+    /// so only a change of size, chroma or alpha needs a new one.
+    frame: Option<filmcraft_prores::Frame>,
 }
 
 impl VideoEncoder for ProResEncoder {
@@ -149,8 +152,20 @@ impl VideoEncoder for ProResEncoder {
         self.rate.num as u32
     }
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
+        whole_picture(f)?;
         let chroma = self.profile.chroma();
-        let mut fr = filmcraft_prores::Frame::new(f.width, f.height, chroma, 10, self.alpha);
+        let wanted_alpha = self.alpha;
+        let mut fr = match self.frame.take() {
+            Some(fr) if fr.width == f.width && fr.height == f.height && fr.chroma == chroma && fr.alpha.is_some() == wanted_alpha => fr,
+            _ => filmcraft_prores::Frame::new(f.width, f.height, chroma, 10, wanted_alpha),
+        };
+        if f.hdr.is_some()
+            && let Some(a) = fr.alpha.as_mut()
+        {
+            // HDR input carries no alpha and `to_yuv444_10` leaves the plane alone for it: a fresh frame is
+            // opaque, but a reused one would otherwise keep the previous frame's alpha
+            a.fill(1023);
+        }
         let (w, h) = (f.width as usize, f.height as usize);
         timed(Stage::Convert, || match (chroma, f.hdr) {
             (filmcraft_prores::ChromaFormat::Yuv444, hdr) => {
@@ -163,12 +178,27 @@ impl VideoEncoder for ProResEncoder {
             }
             (_, None) => rgba_to_yuv422_10(f.rgba, w, h, &mut fr.y, &mut fr.cb, &mut fr.cr),
         });
-        let data = self.enc.encode(&fr).map_err(|e| ExportError::Encode(e.to_string()))?;
+        let encoded = self.enc.encode(&fr);
+        self.frame = Some(fr);
+        let data = encoded.map_err(|e| ExportError::Encode(e.to_string()))?;
         Ok(vec![EncodedPacket { data, key: true, duration: self.rate.den as u32, composition_offset: 0 }])
     }
     fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
         Ok(Vec::new())
     }
+}
+
+/// Refuse a picture whose pixels (the float pixels of an HDR frame, else the RGBA8) do not cover
+/// its size. The ProRes and DNxHR encoders keep their frame between pictures and the 4:2:2
+/// conversions skip rows the source does not cover, so a short source would otherwise be coded
+/// with the previous picture's rows.
+fn whole_picture(f: &EncoderFrame) -> Result<()> {
+    let px = (f.width as usize).checked_mul(f.height as usize);
+    let covered = match f.hdr {
+        Some(rgb) => px.and_then(|n| n.checked_mul(3)).is_some_and(|n| rgb.len() >= n),
+        None => px.and_then(|n| n.checked_mul(4)).is_some_and(|n| f.rgba.len() >= n),
+    };
+    if covered { Ok(()) } else { Err(ExportError::Encode(format!("a {}x{} picture arrived without all of its pixels", f.width, f.height))) }
 }
 
 /// The ProRes profile named by [`ExportSettings::prores_profile`].
@@ -184,18 +214,20 @@ pub fn prores_profile(name: &str) -> filmcraft_prores::Profile {
     }
 }
 
+fn prores_encoder(w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> ProResEncoder {
+    let profile = prores_profile(&s.prores_profile);
+    let mut cfg = filmcraft_prores::EncoderConfig::new(profile, w, h);
+    if s.signal.is_hdr() {
+        cfg.color = filmcraft_prores::ColorInfo { primaries: s.signal.primaries, transfer: s.signal.transfer, matrix: s.signal.matrix };
+    }
+    let alpha = s.keeps_alpha();
+    cfg.encode_alpha = alpha;
+    let enc = filmcraft_prores::Encoder::with_config(cfg);
+    ProResEncoder { enc, profile, alpha, w, h, rate, signal: s.signal, frame: None }
+}
+
 pub(crate) fn prores_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
-    (format == Format::ProRes).then(|| {
-        let profile = prores_profile(&s.prores_profile);
-        let mut cfg = filmcraft_prores::EncoderConfig::new(profile, w, h);
-        if s.signal.is_hdr() {
-            cfg.color = filmcraft_prores::ColorInfo { primaries: s.signal.primaries, transfer: s.signal.transfer, matrix: s.signal.matrix };
-        }
-        let alpha = s.keeps_alpha();
-        cfg.encode_alpha = alpha;
-        let enc = filmcraft_prores::Encoder::with_config(cfg);
-        Ok(Box::new(ProResEncoder { enc, profile, alpha, w, h, rate, signal: s.signal }) as Box<dyn VideoEncoder>)
-    })
+    (format == Format::ProRes).then(|| Ok(Box::new(prores_encoder(w, h, rate, s)) as Box<dyn VideoEncoder>))
 }
 
 /// The DNxHR profile named by [`ExportSettings::dnx_profile`].
@@ -217,6 +249,8 @@ struct DnxEncoder {
     h: u32,
     rate: FrameRate,
     signal: ColorSignal,
+    /// The picture converted into, kept between frames: the conversions overwrite every sample.
+    frame: Option<filmcraft_dnx::Frame>,
 }
 
 impl VideoEncoder for DnxEncoder {
@@ -229,7 +263,12 @@ impl VideoEncoder for DnxEncoder {
         self.rate.num as u32
     }
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
-        let mut fr = filmcraft_dnx::Frame::new(f.width, f.height, filmcraft_dnx::ChromaFormat::Yuv422, 10, false);
+        whole_picture(f)?;
+        let chroma = filmcraft_dnx::ChromaFormat::Yuv422;
+        let mut fr = match self.frame.take() {
+            Some(fr) if fr.width == f.width && fr.height == f.height && fr.chroma == chroma && fr.alpha.is_none() => fr,
+            _ => filmcraft_dnx::Frame::new(f.width, f.height, chroma, 10, false),
+        };
         match f.hdr {
             Some(rgb) => {
                 let (kr, kb) = self.signal.kr_kb();
@@ -238,7 +277,9 @@ impl VideoEncoder for DnxEncoder {
             None => rgba_to_yuv422_10(f.rgba, f.width as usize, f.height as usize, &mut fr.y, &mut fr.cb, &mut fr.cr),
         }
         // the encoder rescales 10-bit input to its coded depth
-        let data = self.enc.encode(&fr).map_err(|e| ExportError::Encode(e.to_string()))?;
+        let encoded = self.enc.encode(&fr);
+        self.frame = Some(fr);
+        let data = encoded.map_err(|e| ExportError::Encode(e.to_string()))?;
         Ok(vec![EncodedPacket { data, key: true, duration: self.rate.den as u32, composition_offset: 0 }])
     }
     fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
@@ -246,15 +287,17 @@ impl VideoEncoder for DnxEncoder {
     }
 }
 
+fn dnx_encoder(w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Result<DnxEncoder> {
+    let mut cfg = filmcraft_dnx::EncoderConfig::new(dnx_profile(&s.dnx_profile), w, h);
+    if s.signal.primaries == 9 {
+        cfg.color_volume = filmcraft_dnx::ColorVolume::Bt2020Ncl;
+    }
+    let enc = filmcraft_dnx::Encoder::with_config(cfg).map_err(|e| ExportError::Encode(e.to_string()))?;
+    Ok(DnxEncoder { enc, w, h, rate, signal: s.signal, frame: None })
+}
+
 pub(crate) fn dnx_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
-    (format == Format::DnxHr).then(|| {
-        let mut cfg = filmcraft_dnx::EncoderConfig::new(dnx_profile(&s.dnx_profile), w, h);
-        if s.signal.primaries == 9 {
-            cfg.color_volume = filmcraft_dnx::ColorVolume::Bt2020Ncl;
-        }
-        let enc = filmcraft_dnx::Encoder::with_config(cfg).map_err(|e| ExportError::Encode(e.to_string()))?;
-        Ok(Box::new(DnxEncoder { enc, w, h, rate, signal: s.signal }) as Box<dyn VideoEncoder>)
-    })
+    (format == Format::DnxHr).then(|| dnx_encoder(w, h, rate, s).map(|e| Box::new(e) as Box<dyn VideoEncoder>))
 }
 
 /// The APV profile named by [`ExportSettings::apv_profile`].
@@ -368,9 +411,28 @@ struct H264Encoder {
     /// 8-bit 4:2:0 planes the render threads converted ahead ([`VideoEncoder::prepare_ahead`]), by
     /// picture index.
     ready: Arc<Mutex<std::collections::HashMap<u64, Yuv420>>>,
+    /// Plane sets no longer in use, for [`VideoEncoder::prepare_ahead`] to convert into again
+    /// instead of allocating a set per picture.
+    spare: Arc<Mutex<Vec<Yuv420>>>,
 }
 
 type Yuv420 = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// How many spare plane sets [`H264Encoder`] keeps. The sets in use are bounded by the pictures in
+/// flight between the render threads and the encoder; the cap keeps memory bounded if rendering and
+/// encoding ever stop pairing up (pictures rendered and never encoded).
+const SPARE_PLANES: usize = 8;
+
+/// Keep `planes` for reuse unless the pool is full (or they hold no memory).
+fn recycle(spare: &Mutex<Vec<Yuv420>>, planes: Yuv420) {
+    if planes.0.capacity() == 0 {
+        return;
+    }
+    let mut spare = spare.lock().unwrap_or_else(PoisonError::into_inner);
+    if spare.len() < SPARE_PLANES {
+        spare.push(planes);
+    }
+}
 
 /// The encoder input of `f`: 8-bit limited-range 4:2:0 in the export's colour signal.
 fn h264_input(f: &EncoderFrame, signal: ColorSignal, y: &mut Vec<u8>, u: &mut Vec<u8>, v: &mut Vec<u8>) {
@@ -435,17 +497,33 @@ impl VideoEncoder for H264Encoder {
             let ps = self.encode10(f)?;
             return Ok(self.packets(ps));
         }
-        let ready = {
+        let (ready, stale) = {
             let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
             let mine = ready.remove(&f.index);
             // anything older belongs to a batch that was rendered and then not encoded
-            ready.retain(|&i, _| i > f.index);
-            mine
+            let old: Vec<u64> = ready.keys().copied().filter(|&i| i <= f.index).collect();
+            let stale: Vec<Yuv420> = old.into_iter().filter_map(|i| ready.remove(&i)).collect();
+            (mine, stale)
         };
+        // the ready lock is released: hand the unused planes back to the pool
+        for planes in stale {
+            recycle(&self.spare, planes);
+        }
         let (w, h) = (f.width as usize, f.height as usize);
         let chroma = w.div_ceil(2) * h.div_ceil(2);
-        match ready.filter(|(y, u, v)| y.len() == w * h && u.len() == chroma && v.len() == chroma) {
-            Some((y, u, v)) => (self.y, self.u, self.v) = (y, u, v),
+        let usable = ready.and_then(|planes| {
+            if planes.0.len() == w * h && planes.1.len() == chroma && planes.2.len() == chroma {
+                Some(planes)
+            } else {
+                recycle(&self.spare, planes);
+                None
+            }
+        });
+        match usable {
+            Some((y, u, v)) => {
+                let old = (std::mem::replace(&mut self.y, y), std::mem::replace(&mut self.u, u), std::mem::replace(&mut self.v, v));
+                recycle(&self.spare, old);
+            }
             None => {
                 let (enc, y, u, v, signal) = (&self.enc, &mut self.y, &mut self.u, &mut self.v, self.signal);
                 // on the encoder's own threads: the global pool is busy rendering the next batch
@@ -473,11 +551,16 @@ impl VideoEncoder for H264Encoder {
         if self.deep() {
             return None;
         }
-        let (ready, signal) = (self.ready.clone(), self.signal);
+        let (ready, spare, signal) = (self.ready.clone(), self.spare.clone(), self.signal);
         Some(Arc::new(move |f: &EncoderFrame| {
-            let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+            // the conversion resizes the planes in place, whatever size the set had
+            let popped = spare.lock().unwrap_or_else(PoisonError::into_inner).pop();
+            let (mut y, mut u, mut v) = popped.unwrap_or_default();
             timed(Stage::Convert, || h264_input(f, signal, &mut y, &mut u, &mut v));
-            ready.lock().unwrap_or_else(PoisonError::into_inner).insert(f.index, (y, u, v));
+            let replaced = ready.lock().unwrap_or_else(PoisonError::into_inner).insert(f.index, (y, u, v));
+            if let Some(planes) = replaced {
+                recycle(&spare, planes);
+            }
         }))
     }
 }
@@ -537,8 +620,215 @@ pub(crate) fn h264_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &
         filmcraft_h264enc::Encoder::new(cfg)
             .map(|enc| {
                 let (y, u, v, y16, u16, v16) = Default::default();
-                Box::new(H264Encoder { enc, w, h, rate, y, u, v, y16, u16, v16, signal: s.signal, ready: Default::default() }) as Box<dyn VideoEncoder>
+                Box::new(H264Encoder { enc, w, h, rate, y, u, v, y16, u16, v16, signal: s.signal, ready: Default::default(), spare: Default::default() })
+                    as Box<dyn VideoEncoder>
             })
             .map_err(|e| ExportError::Encode(e.to_string())),
     )
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+
+    const W: u32 = 96;
+    const H: u32 = 64;
+
+    fn rgba(t: u32, alpha: u8) -> Vec<u8> {
+        (0..W * H)
+            .flat_map(|i| {
+                let (x, y) = (i % W, i / W);
+                [(x * 3 + t * 37) as u8, (y * 5 + t * 11) as u8, ((x ^ y) * 2 + t * 3) as u8, alpha]
+            })
+            .collect()
+    }
+
+    fn hdr(t: u32) -> Vec<f32> {
+        (0..W * H * 3).map(|i| ((i * 7 + t * 131) % 1000) as f32 / 900.0 - 0.05).collect()
+    }
+
+    /// One input picture: straight RGBA8 with a flat alpha, or HDR floats.
+    struct Input {
+        rgba: Vec<u8>,
+        hdr: Option<Vec<f32>>,
+    }
+
+    fn encode(enc: &mut dyn VideoEncoder, inputs: &[Input], index: u64) -> Vec<u8> {
+        let f = &inputs[index as usize];
+        let frame = EncoderFrame { width: W, height: H, rgba: &f.rgba, hdr: f.hdr.as_deref(), index };
+        enc.encode(&frame).expect("encodes").into_iter().flat_map(|p| p.data).collect()
+    }
+
+    /// The pictures one frame at a time through one encoder that keeps its frame must give the packets
+    /// of an identical encoder given a fresh frame every time (the encoders themselves may carry state).
+    fn prores_reuse_matches_fresh(s: &ExportSettings, inputs: &[Input]) {
+        let (mut reused, mut fresh) = (prores_encoder(W, H, FrameRate::FPS_24, s), prores_encoder(W, H, FrameRate::FPS_24, s));
+        for i in 0..inputs.len() as u64 {
+            fresh.frame = None;
+            assert!(encode(&mut reused, inputs, i) == encode(&mut fresh, inputs, i), "frame {i}");
+        }
+    }
+
+    fn sdr(t: u32, alpha: u8) -> Input {
+        Input { rgba: rgba(t, alpha), hdr: None }
+    }
+
+    fn hdr_input(t: u32) -> Input {
+        Input { rgba: rgba(t, 255), hdr: Some(hdr(t)) }
+    }
+
+    #[test]
+    fn prores_422_reuses_its_frame_with_identical_packets() {
+        let s = ExportSettings { format: Format::ProRes, ..Default::default() };
+        let inputs: Vec<Input> = (0..4).map(|t| sdr(t, 255)).collect();
+        prores_reuse_matches_fresh(&s, &inputs);
+        let s = ExportSettings { format: Format::ProRes, signal: ColorSignal::PQ, ..Default::default() };
+        let inputs: Vec<Input> = (0..4).map(|t| if t % 2 == 0 { hdr_input(t) } else { sdr(t, 255) }).collect();
+        prores_reuse_matches_fresh(&s, &inputs);
+    }
+
+    #[test]
+    fn prores_4444_alpha_does_not_leak_into_the_next_hdr_frame() {
+        let s = ExportSettings { format: Format::ProRes, prores_profile: "4444".into(), alpha: true, signal: ColorSignal::PQ, ..Default::default() };
+        assert!(s.keeps_alpha());
+        // an SDR frame with partial alpha, then an HDR frame (opaque), then SDR again
+        let inputs = vec![sdr(0, 40), hdr_input(1), sdr(2, 200), sdr(3, 0), hdr_input(4)];
+        prores_reuse_matches_fresh(&s, &inputs);
+    }
+
+    #[test]
+    fn prores_keeps_its_frame_between_encodes() {
+        let s = ExportSettings { format: Format::ProRes, ..Default::default() };
+        let mut enc = prores_encoder(W, H, FrameRate::FPS_24, &s);
+        let inputs: Vec<Input> = (0..3).map(|t| sdr(t, 255)).collect();
+        assert!(enc.frame.is_none());
+        encode(&mut enc, &inputs, 0);
+        let ptr = enc.frame.as_ref().map(|f| f.y.as_ptr());
+        assert!(ptr.is_some());
+        encode(&mut enc, &inputs, 1);
+        assert_eq!(enc.frame.as_ref().map(|f| f.y.as_ptr()), ptr, "the second frame converted into a new allocation");
+        encode(&mut enc, &inputs, 2);
+        assert_eq!(enc.frame.as_ref().map(|f| f.y.as_ptr()), ptr);
+    }
+
+    #[test]
+    fn dnxhr_hqx_reuses_its_frame_with_identical_packets() {
+        let s = ExportSettings { format: Format::DnxHr, dnx_profile: "hqx".into(), ..Default::default() };
+        let inputs: Vec<Input> = (0..4).map(|t| if t == 2 { hdr_input(t) } else { sdr(t, 255) }).collect();
+        let (mut reused, mut fresh) = (dnx_encoder(W, H, FrameRate::FPS_24, &s).expect("builds"), dnx_encoder(W, H, FrameRate::FPS_24, &s).expect("builds"));
+        for i in 0..inputs.len() as u64 {
+            fresh.frame = None;
+            assert!(encode(&mut reused, &inputs, i) == encode(&mut fresh, &inputs, i), "frame {i}");
+        }
+        let ptr = reused.frame.as_ref().map(|f| f.y.as_ptr());
+        assert!(ptr.is_some());
+        encode(&mut reused, &inputs, 0);
+        assert_eq!(reused.frame.as_ref().map(|f| f.y.as_ptr()), ptr, "the frame was reallocated");
+    }
+
+    fn h264_encoder() -> H264Encoder {
+        let cfg = filmcraft_h264enc::EncoderConfig::new(W, H, 24, 1);
+        H264Encoder {
+            enc: filmcraft_h264enc::Encoder::new(cfg).expect("builds"),
+            w: W,
+            h: H,
+            rate: FrameRate::FPS_24,
+            y: Vec::new(),
+            u: Vec::new(),
+            v: Vec::new(),
+            y16: Vec::new(),
+            u16: Vec::new(),
+            v16: Vec::new(),
+            signal: ColorSignal::default(),
+            ready: Default::default(),
+            spare: Default::default(),
+        }
+    }
+
+    fn frame_of(rgba: &[u8], index: u64) -> EncoderFrame<'_> {
+        EncoderFrame { width: W, height: H, rgba, hdr: None, index }
+    }
+
+    fn ready_y_ptr(enc: &H264Encoder, index: u64) -> Option<*const u8> {
+        enc.ready.lock().unwrap().get(&index).map(|p| p.0.as_ptr())
+    }
+
+    #[test]
+    fn h264_prepared_planes_come_from_the_ones_the_encoder_finished_with() {
+        let mut enc = h264_encoder();
+        let prepare = enc.prepare_ahead().expect("8-bit converts ahead");
+        let pics: Vec<Vec<u8>> = (0..4).map(|t| rgba(t, 255)).collect();
+        prepare(&frame_of(&pics[0], 0));
+        let first = ready_y_ptr(&enc, 0).expect("prepared");
+        enc.encode(&frame_of(&pics[0], 0)).expect("encodes");
+        assert_eq!(enc.y.as_ptr(), first, "the prepared planes are the encoder's input");
+        assert!(enc.spare.lock().unwrap().is_empty(), "nothing to give back yet");
+        prepare(&frame_of(&pics[1], 1));
+        let second = ready_y_ptr(&enc, 1).expect("prepared");
+        assert_ne!(second, first, "the first set is still in use");
+        enc.encode(&frame_of(&pics[1], 1)).expect("encodes");
+        assert_eq!(enc.spare.lock().unwrap().len(), 1, "frame 0's planes went to the pool");
+        // the next conversion reuses them
+        prepare(&frame_of(&pics[2], 2));
+        assert_eq!(ready_y_ptr(&enc, 2), Some(first));
+        assert!(enc.spare.lock().unwrap().is_empty());
+        // and the packets are what converting in `encode` gives
+        let mut plain = h264_encoder();
+        let a: Vec<u8> = enc.encode(&frame_of(&pics[2], 2)).expect("encodes").into_iter().flat_map(|p| p.data).collect();
+        for t in 0..2 {
+            plain.encode(&frame_of(&pics[t], t as u64)).expect("encodes");
+        }
+        let b: Vec<u8> = plain.encode(&frame_of(&pics[2], 2)).expect("encodes").into_iter().flat_map(|p| p.data).collect();
+        assert!(a == b);
+    }
+
+    #[test]
+    fn h264_spare_pool_stays_bounded() {
+        let mut enc = h264_encoder();
+        let prepare = enc.prepare_ahead().expect("8-bit converts ahead");
+        let pic = rgba(0, 255);
+        // many pictures rendered and then skipped over: encode only the last, so the others are stale
+        for i in 0..(3 * SPARE_PLANES as u64) {
+            prepare(&frame_of(&pic, i));
+        }
+        let last = 3 * SPARE_PLANES as u64;
+        prepare(&frame_of(&pic, last));
+        enc.encode(&frame_of(&pic, last)).expect("encodes");
+        assert_eq!(enc.spare.lock().unwrap().len(), SPARE_PLANES);
+        assert!(enc.ready.lock().unwrap().is_empty());
+        // more rounds never grow it
+        for round in 1..4u64 {
+            let base = last + round * 100;
+            for i in 0..(2 * SPARE_PLANES as u64) {
+                prepare(&frame_of(&pic, base + i));
+            }
+            enc.encode(&frame_of(&pic, base + 2 * SPARE_PLANES as u64 - 1)).expect("encodes");
+            assert!(enc.spare.lock().unwrap().len() <= SPARE_PLANES);
+        }
+    }
+
+    /// A picture whose pixels are shorter than its size is an error (it used to index past the end
+    /// of the source and panic), and the encoder carries on with the next whole picture.
+    #[test]
+    fn a_short_picture_is_an_error_not_a_panic() {
+        let inputs = [sdr(0, 255)];
+        let whole = &inputs[0];
+        let short_rgba = &whole.rgba[..whole.rgba.len() / 2];
+        let short_hdr = hdr(0);
+        let short_hdr = &short_hdr[..short_hdr.len() - 3];
+        let shorts = [
+            EncoderFrame { width: W, height: H, rgba: short_rgba, hdr: None, index: 0 },
+            EncoderFrame { width: W, height: H, rgba: &whole.rgba, hdr: Some(short_hdr), index: 0 },
+        ];
+        let s = ExportSettings { format: Format::ProRes, ..Default::default() };
+        let mut prores = prores_encoder(W, H, FrameRate::FPS_24, &s);
+        let s = ExportSettings { format: Format::DnxHr, ..Default::default() };
+        let mut dnx = dnx_encoder(W, H, FrameRate::FPS_24, &s).expect("builds");
+        for enc in [&mut prores as &mut dyn VideoEncoder, &mut dnx] {
+            for f in &shorts {
+                assert!(enc.encode(f).is_err());
+            }
+            assert!(!encode(enc, &inputs, 0).is_empty());
+        }
+    }
 }
