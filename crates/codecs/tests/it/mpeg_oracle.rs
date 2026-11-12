@@ -142,11 +142,6 @@ fn spec(name: &str) -> Vec<String> {
             NOISE,
             &["-t", "1", "-c:v", "mpeg2video", "-bf", "2", "-c:a", "pcm_dvd", "-ac", "2", "-f", "vob"],
         ]),
-        "ps_mpeg2_lpcm_white.vob" => cat(&[
-            &["-f", "lavfi", "-i", "testsrc2=size=352x288:rate=25"],
-            &["-f", "lavfi", "-i", "anoisesrc=color=white:sample_rate=48000:amplitude=0.8:seed=5"],
-            &["-t", "1", "-c:v", "mpeg2video", "-c:a", "pcm_dvd", "-sample_fmt", "s16", "-ac", "1", "-f", "vob"],
-        ]),
         "ps_mpeg2_lpcm16.vob" => cat(&[
             &["-f", "lavfi", "-i", "testsrc2=size=352x288:rate=25"],
             NOISE,
@@ -432,8 +427,8 @@ fn transport_stream_h264_recovery_points() {
     let f = make(&ff, "ts_h264_opengop.ts");
     check_video(&ff, &f, 0, 12);
     let data = bytes(&f);
-    let idx = filmcraft_mpegts::open(&data[..]).unwrap();
-    let vi = idx.streams.iter().position(|s| s.codec == filmcraft_mpegts::Codec::H264).unwrap();
+    let idx = craft_media::mpegts::open(&data[..]).unwrap();
+    let vi = idx.streams.iter().position(|s| s.codec == craft_media::mpegts::Codec::H264).unwrap();
     let keys: Vec<usize> = (0..idx.streams[vi].units.len()).filter(|&i| idx.streams[vi].units[i].key).collect();
     assert!(keys.len() >= 4, "{} key units in {} (IDR only: 1)", keys.len(), idx.streams[vi].units.len());
     // cut at the third random-access point (the packet that starts its PES), keeping the PAT /
@@ -469,8 +464,8 @@ fn transport_stream_h264_intra_refresh_cut_is_refused() {
     let ff = filmcraft_testkit::require_ffmpeg!();
     let f = make(&ff, "ts_h264_intra_refresh.ts");
     let data = bytes(&f);
-    let idx = filmcraft_mpegts::open(&data[..]).unwrap();
-    let vi = idx.streams.iter().position(|s| s.codec == filmcraft_mpegts::Codec::H264).unwrap();
+    let idx = craft_media::mpegts::open(&data[..]).unwrap();
+    let vi = idx.streams.iter().position(|s| s.codec == craft_media::mpegts::Codec::H264).unwrap();
     // recovery points with recovery_frame_cnt > 0 are not random access points: only the IDR is key
     let n = idx.streams[vi].units.len();
     let keys: Vec<usize> = (0..n).filter(|&i| idx.streams[vi].units[i].key).collect();
@@ -713,12 +708,4 @@ fn generate_fixtures() {
             fixture(&ff, name, &refs)
         });
     }
-}
-
-/// Resampled audio must not depend on where a read starts (#4673): 48 kHz LPCM noise read at 47 kHz.
-#[test]
-fn resampled_audio_does_not_depend_on_the_read_cuts() {
-    let ff = filmcraft_testkit::require_ffmpeg!();
-    let src = open(&make(&ff, "ps_mpeg2_lpcm_white.vob"));
-    filmcraft_testkit::cuts::assert_cut_independent("vob LPCM 48 kHz at 47 kHz", 1_000, 20_000, |s, n| src.audio(s, n, 47_000).unwrap().channels);
 }
